@@ -4,13 +4,14 @@ export interface Song {
     title: string;
     artist: string;
     duration: number;
-    coverUrl?: string;
-    downloadUrl?: string;
+    coverUrl?: string | undefined;
+    downloadUrl?: string | undefined;
 }
 
 // Playslist structure
 export interface Playlist {
     name: string;
+    uploader?: string;
     songs: Song[];
     totalCount: number;
 }
