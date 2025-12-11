@@ -4,3 +4,7 @@
 /temp
 /.env
 /.vscode
+# Ignore any player script dumps or transient fetched assets
+*player-script.js
+*.player-script.js
+176*.js
