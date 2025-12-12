@@ -26,12 +26,14 @@ async function isOnline(): Promise<boolean> {
   return new Promise((resolve) => {
     const req = https.get(
       {
-        hostname: 'clients3.google.com',
-        path: '/generate_204',
-        timeout: 3000,
+        hostname: 'www.youtube.com',
+        path: '/',
+        timeout: 5000,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
       },
       (res) => {
         res.resume();
+        // Any HTTP response means the connection is up
         resolve(true);
       }
     );
@@ -105,9 +107,6 @@ async function downloadSong(
 
   try {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      // Ensure connectivity before attempting
-      await waitForReconnect('');
-
       // Update progress: downloading
       onProgress?.({
         songId: song.id,
