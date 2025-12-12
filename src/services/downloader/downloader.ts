@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import https from 'https';
 import { execSync } from 'child_process';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
@@ -7,6 +8,66 @@ import PQueue from 'p-queue';
 import { logger } from '../../utils/logger.js';
 import { sanitizeFilename } from '../../utils/validator.js';
 import type { Song, DownloadProgress } from '../../types/index.js';
+
+const NETWORK_ERROR_PATTERNS = [
+  /ENOTFOUND/i,
+  /EAI_AGAIN/i,
+  /ECONNRESET/i,
+  /ETIMEDOUT/i,
+  /network is unreachable/i,
+  /getaddrinfo ENOTFOUND/i,
+  /Temporary failure in name resolution/i,
+  /Resolving timed out/i,
+];
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function isOnline(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = https.get(
+      {
+        hostname: 'clients3.google.com',
+        path: '/generate_204',
+        timeout: 3000,
+      },
+      (res) => {
+        res.resume();
+        resolve(true);
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on('error', () => resolve(false));
+  });
+}
+
+async function waitForReconnect(logPrefix: string): Promise<void> {
+  let announced = false;
+  while (true) {
+    const online = await isOnline();
+    if (online) {
+      if (announced) {
+        console.log(`${logPrefix}🌐 Internet reconnected. Resuming downloads...`);
+      }
+      return;
+    }
+
+    if (!announced) {
+      console.log(`${logPrefix}🌐 No internet. Pausing downloads until connection is back...`);
+      announced = true;
+    } else {
+      console.log(`${logPrefix}🌐 Still offline. Retrying in 5s...`);
+    }
+    await delay(5000);
+  }
+}
+
+function isNetworkError(message: string): boolean {
+  return NETWORK_ERROR_PATTERNS.some((pattern) => pattern.test(message));
+}
 
 // Set FFmpeg path
 if (ffmpegStatic) {
@@ -40,27 +101,48 @@ async function downloadSong(
   const sanitizedTitle = sanitizeFilename(`${song.artist} - ${song.title}`);
   const outputPath = path.join(outputDir, `${sanitizedTitle}.mp3`);
   const tempAudioPath = path.join(outputDir, `${sanitizedTitle}.webm`);
+  const maxRetries = 4;
 
   try {
-    // Update progress: downloading
-    onProgress?.({
-      songId: song.id,
-      title: song.title,
-      status: 'downloading',
-      progress: 0,
-    });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      // Ensure connectivity before attempting
+      await waitForReconnect('');
 
-    // Download with yt-dlp
-    const videoUrl = `https://www.youtube.com/watch?v=${song.id}`;
-    const cookiesArg = cookiesFile ? `--cookies "${cookiesFile}"` : '';
-    const downloadCommand = `py -m yt_dlp -f "bestaudio[ext=webm]/bestaudio" ${cookiesArg} "${videoUrl}" -o "${tempAudioPath}" --no-warnings`;
-    
-    try {
-      execSync(downloadCommand, {
-        stdio: 'pipe', // Suppress output
+      // Update progress: downloading
+      onProgress?.({
+        songId: song.id,
+        title: song.title,
+        status: 'downloading',
+        progress: 0,
       });
-    } catch (err) {
-      throw new Error(`yt-dlp download failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+
+      // Construct yt-dlp command
+      const cookiesArg = cookiesFile ? `--cookies "${cookiesFile}"` : '';
+      const command = `py -m yt_dlp -f "bestaudio[ext=webm]/bestaudio" ${cookiesArg} "https://www.youtube.com/watch?v=${song.id}" -o "${tempAudioPath}" --no-warnings`;
+
+      try {
+        execSync(command, {
+          stdio: 'ignore',
+          maxBuffer: 100 * 1024 * 1024,
+        });
+        break; // success; exit retry loop
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Unknown error';
+
+        // Clean up temp file if created
+        if (fs.existsSync(tempAudioPath)) {
+          fs.unlinkSync(tempAudioPath);
+        }
+
+        if (isNetworkError(message) && attempt < maxRetries) {
+          const prefix = `(${attempt}/${maxRetries}) `;
+          console.log(`${prefix}Network issue detected. Pausing until internet returns...`);
+          await waitForReconnect(prefix);
+          continue; // retry
+        }
+
+        throw error;
+      }
     }
 
     // Convert to MP3 with FFmpeg
