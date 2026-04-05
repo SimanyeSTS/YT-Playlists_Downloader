@@ -24,6 +24,8 @@ npm run build
 
 ## Usage
 
+When using `npm start`, pass app arguments after `--`. Without it, npm can treat flags like `--no-metadata` as npm config instead of forwarding them to the app. The app also honors `npm_config_metadata=false`, so the flag still works if npm swallows it.
+
 ```bash
 # Download a playlist
 npm start -- "https://music.youtube.com/playlist?list=YOUR_PLAYLIST_ID"
@@ -39,6 +41,21 @@ npm start -- "https://music.youtube.com/playlist?list=YOUR_PLAYLIST_ID" --no-met
 
 # Custom concurrency (10 songs at once)
 npm start -- "https://music.youtube.com/playlist?list=YOUR_PLAYLIST_ID" -c 10
+
+# Use browser cookies directly (helps with HTTP 403)
+npm start -- "https://music.youtube.com/playlist?list=YOUR_PLAYLIST_ID" --cookies-from-browser chrome --no-metadata
+```
+
+If you see `Could not copy Chrome cookie database`:
+
+1. Close Chrome completely (all windows and background processes).
+2. Retry the command.
+3. If it still fails, export a `cookies.txt` file and use `--cookies <path>` instead.
+
+If you are using Git Bash or another shell that treats `&` as a special character, always quote the full playlist URL:
+
+```bash
+npm start -- "https://music.youtube.com/playlist?list=YOUR_PLAYLIST_ID&si=YOUR_TOKEN" --no-metadata
 ```
 
 ## Options
@@ -46,6 +63,7 @@ npm start -- "https://music.youtube.com/playlist?list=YOUR_PLAYLIST_ID" -c 10
 - `-o, --output <dir>` - Output directory (default: `./downloads`)
 - `-c, --concurrency <number>` - Concurrent downloads (default: `5`)
 - `--cookies <file>` - Path to cookies.txt for private/age-restricted content
+- `--cookies-from-browser <browser>` - Read cookies directly from browser profile (chrome, edge, firefox, brave, opera, vivaldi)
 - `--no-zip` - Skip ZIP creation, keep individual files
 - `--no-metadata` - Skip adding ID3 tags
 
@@ -107,6 +125,7 @@ src/
 - **Accurate naming**: ZIP files include both album/playlist name and artist/uploader (e.g., "Ballads — Soul Brothers.zip")
 - **Real-time progress**: See individual song download/conversion status as it happens
 - **yt-dlp powered**: Uses the industry-standard yt-dlp tool to bypass YouTube's anti-bot protections
+- **MP3-only output**: If yt-dlp receives an MP4 or M4A source, it extracts and saves it as MP3
 - **Cookie support**: Access private, unlisted, or age-restricted content with browser cookies
 - YouTube may rate-limit requests; the tool uses concurrency control to minimize this
 - Failed downloads are logged but don't stop the entire process

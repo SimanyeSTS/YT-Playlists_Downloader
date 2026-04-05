@@ -1,9 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
-import { execSync } from 'child_process';
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegStatic from 'ffmpeg-static';
+import { spawnSync } from 'child_process';
 import PQueue from 'p-queue';
 import { logger } from '../../utils/logger.js';
 import { sanitizeFilename } from '../../utils/validator.js';
@@ -71,9 +69,30 @@ function isNetworkError(message: string): boolean {
   return NETWORK_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }
 
-// Set FFmpeg path
-if (ffmpegStatic) {
-  ffmpeg.setFfmpegPath(ffmpegStatic as unknown as string);
+function getProcessErrorOutput(stdout?: string, stderr?: string): string {
+  return [stdout, stderr].filter((part) => part && part.trim().length > 0).join('\n').trim();
+}
+
+function isInterrupted(message: string, signal?: string | null): boolean {
+  return signal === 'SIGINT' || /Interrupted by user/i.test(message) || signal === 'SIGTERM';
+}
+
+class DownloadCancelledError extends Error {
+  constructor() {
+    super('Download cancelled');
+    this.name = 'DownloadCancelledError';
+  }
+}
+
+class DownloadSetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DownloadSetupError';
+  }
+}
+
+function isBrowserCookieAccessError(message: string): boolean {
+  return /Could not copy Chrome cookie database/i.test(message) || /cookies-from-browser/i.test(message) && /cookie database/i.test(message);
 }
 
 export interface DownloadOptions {
@@ -81,7 +100,9 @@ export interface DownloadOptions {
   concurrency?: number;
   quality?: string;
   cookiesFile?: string;
+  cookiesFromBrowser?: string;
   onProgress?: (progress: DownloadProgress) => void;
+  isCancelled?: () => boolean;
 }
 
 export interface DownloadResult {
@@ -98,15 +119,25 @@ async function downloadSong(
   song: Song,
   outputDir: string,
   cookiesFile?: string,
-  onProgress?: (progress: DownloadProgress) => void
+  cookiesFromBrowser?: string,
+  onProgress?: (progress: DownloadProgress) => void,
+  isCancelled?: () => boolean
 ): Promise<DownloadResult> {
   const sanitizedTitle = sanitizeFilename(`${song.artist} - ${song.title}`);
-  const outputPath = path.join(outputDir, `${sanitizedTitle}.mp3`);
-  const tempAudioPath = path.join(outputDir, `${sanitizedTitle}.webm`);
+  const outputBasePath = path.join(outputDir, sanitizedTitle);
+  const outputPath = `${outputBasePath}.mp3`;
   const maxRetries = 4;
 
   try {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      if (isCancelled?.()) {
+        throw new DownloadCancelledError();
+      }
+
+      if (fs.existsSync(outputPath)) {
+        fs.unlinkSync(outputPath);
+      }
+
       // Update progress: downloading
       onProgress?.({
         songId: song.id,
@@ -116,65 +147,66 @@ async function downloadSong(
       });
 
       // Construct yt-dlp command
-      const cookiesArg = cookiesFile ? `--cookies "${cookiesFile}"` : '';
-      const command = `py -m yt_dlp -f "bestaudio[ext=webm]/bestaudio" ${cookiesArg} "https://www.youtube.com/watch?v=${song.id}" -o "${tempAudioPath}" --no-warnings`;
+      const ytDlpArgs = [
+        '-m',
+        'yt_dlp',
+        '-f',
+        'bestaudio/best',
+        '--extract-audio',
+        '--audio-format',
+        'mp3',
+        '--audio-quality',
+        '0',
+        ...(cookiesFile ? ['--cookies', cookiesFile] : []),
+        ...(cookiesFromBrowser ? ['--cookies-from-browser', cookiesFromBrowser] : []),
+        `https://www.youtube.com/watch?v=${song.id}`,
+        '-o',
+        `${outputBasePath}.%(ext)s`,
+        '--no-warnings',
+      ];
 
-      try {
-        execSync(command, {
-          stdio: 'ignore',
-          maxBuffer: 100 * 1024 * 1024,
-        });
-        break; // success; exit retry loop
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-
-        // Clean up temp file if created
-        if (fs.existsSync(tempAudioPath)) {
-          fs.unlinkSync(tempAudioPath);
-        }
-
-        if (isNetworkError(message) && attempt < maxRetries) {
-          const prefix = `(${attempt}/${maxRetries}) `;
-          console.log(`${prefix}Network issue detected. Pausing until internet returns...`);
-          await waitForReconnect(prefix);
-          continue; // retry
-        }
-
-        throw error;
-      }
-    }
-
-    // Convert to MP3 with FFmpeg
-    await new Promise<void>((resolve, reject) => {
-      onProgress?.({
-        songId: song.id,
-        title: song.title,
-        status: 'converting',
-        progress: 50,
+      const result = spawnSync('py', ytDlpArgs, {
+        encoding: 'utf-8',
+        maxBuffer: 100 * 1024 * 1024,
       });
 
-      ffmpeg(tempAudioPath)
-        .audioBitrate(320)
-        .audioCodec('libmp3lame')
-        .format('mp3')
-        .on('end', () => {
-          // Clean up temp file
-          if (fs.existsSync(tempAudioPath)) {
-            fs.unlinkSync(tempAudioPath);
-          }
-          
-          onProgress?.({
-            songId: song.id,
-            title: song.title,
-            status: 'completed',
-            progress: 100,
-          });
-          resolve();
-        })
-        .on('error', (err: Error) => {
-          reject(err);
-        })
-        .save(outputPath);
+      if (result.status === 0) {
+        break; // success; exit retry loop
+      }
+
+      const processOutput = getProcessErrorOutput(result.stdout ?? '', result.stderr ?? '');
+      const message = processOutput || result.error?.message || 'Unknown error';
+
+      if (isInterrupted(message, result.signal)) {
+        throw new DownloadCancelledError();
+      }
+
+      if (isNetworkError(message) && attempt < maxRetries) {
+        const prefix = `(${attempt}/${maxRetries}) `;
+        console.log(`${prefix}Network issue detected. Pausing until internet returns...`);
+        await waitForReconnect(prefix);
+        continue; // retry
+      }
+
+      throw new Error(message);
+    }
+
+    if (!fs.existsSync(outputPath)) {
+      throw new Error(`Expected MP3 output was not created: ${outputPath}`);
+    }
+
+    onProgress?.({
+      songId: song.id,
+      title: song.title,
+      status: 'converting',
+      progress: 50,
+    });
+
+    onProgress?.({
+      songId: song.id,
+      title: song.title,
+      status: 'completed',
+      progress: 100,
     });
 
     return {
@@ -183,11 +215,24 @@ async function downloadSong(
       success: true,
     };
   } catch (error) {
+    if (error instanceof DownloadCancelledError) {
+      throw error;
+    }
+
+    if (error instanceof DownloadSetupError) {
+      throw error;
+    }
+
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    
-    // Clean up temp file if it exists
-    if (fs.existsSync(tempAudioPath)) {
-      fs.unlinkSync(tempAudioPath);
+
+    if (isBrowserCookieAccessError(errorMessage)) {
+      throw new DownloadSetupError(
+        'Could not read browser cookies. Close Chrome completely (including background processes) and retry, or use --cookies <cookies.txt>.'
+      );
+    }
+
+    if (fs.existsSync(outputPath)) {
+      fs.unlinkSync(outputPath);
     }
     
     onProgress?.({
@@ -198,7 +243,9 @@ async function downloadSong(
       error: errorMessage,
     });
 
-    logger.error(`Failed to download "${song.title}": ${errorMessage}`);
+    if (!onProgress) {
+      logger.error(`Failed to download "${song.title}": ${errorMessage}`);
+    }
 
     return {
       song,
@@ -216,7 +263,7 @@ export async function downloadSongs(
   songs: Song[],
   options: DownloadOptions
 ): Promise<DownloadResult[]> {
-  const { outputDir, concurrency = 5, cookiesFile, onProgress } = options;
+  const { outputDir, concurrency = 5, cookiesFile, cookiesFromBrowser, onProgress, isCancelled } = options;
 
   // Ensure output directory exists
   if (!fs.existsSync(outputDir)) {
@@ -232,14 +279,29 @@ export async function downloadSongs(
   // Queue all downloads
   const downloadPromises = songs.map((song) =>
     queue.add(async () => {
-      const result = await downloadSong(song, outputDir, cookiesFile, onProgress);
+      if (isCancelled?.()) {
+        throw new DownloadCancelledError();
+      }
+
+      const result = await downloadSong(song, outputDir, cookiesFile, cookiesFromBrowser, onProgress, isCancelled);
       results.push(result);
       return result;
     })
   );
 
   // Wait for all downloads to complete
-  await Promise.all(downloadPromises);
+  try {
+    await Promise.all(downloadPromises);
+  } catch (error) {
+    queue.clear();
+    if (error instanceof DownloadCancelledError) {
+      throw error;
+    }
+    if (error instanceof DownloadSetupError) {
+      throw error;
+    }
+    throw error;
+  }
 
   const successCount = results.filter((r) => r.success).length;
   const failedCount = results.filter((r) => !r.success).length;

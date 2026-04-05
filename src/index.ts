@@ -30,11 +30,21 @@ program
   .option('--temp-dir <dir>', 'Temporary directory for processing (use different dirs for parallel downloads)', path.join(process.cwd(), '.temp'))
   .option('-c, --concurrency <number>', 'Number of concurrent downloads', '5')
   .option('--cookies <file>', 'Path to cookies.txt file for private/age-restricted content')
+  .option('--cookies-from-browser <browser>', 'Load cookies directly from browser (chrome, edge, firefox, brave, opera, vivaldi)')
   .option('--no-zip', 'Skip creating ZIP archive')
   .option('--no-metadata', 'Skip adding metadata tags')
   .action(async (url: string, options) => {
     const spinner = ora('Initializing...').start();
     logger.setSpinner(spinner);
+    let cancelled = false;
+
+    const handleInterrupt = () => {
+      cancelled = true;
+      logger.warn('Interrupted. Stopping after the current download finishes...');
+    };
+
+    process.once('SIGINT', handleInterrupt);
+    process.once('SIGTERM', handleInterrupt);
 
     try {
       // Step 1: Validate URL and extract playlist ID
@@ -65,6 +75,8 @@ program
         outputDir: tempDir,
         concurrency: parseInt(options.concurrency, 10),
         cookiesFile: options.cookies,
+        cookiesFromBrowser: options.cookiesFromBrowser,
+        isCancelled: () => cancelled,
         onProgress: (progress: DownloadProgress) => {
           if (progress.status === 'completed') {
             completed++;
@@ -93,6 +105,8 @@ program
 
       spinner.succeed(`Downloaded ${successfulDownloads.length}/${playlist.songs.length} songs`);
 
+      const metadataEnabled = options.metadata && process.env.npm_config_metadata !== 'false';
+
       // Log failed downloads
       if (failedDownloads.length > 0) {
         logger.warn('\nFailed downloads:');
@@ -102,7 +116,7 @@ program
       }
 
       // Step 4: Add metadata
-      if (options.metadata) {
+      if (metadataEnabled) {
         spinner.start('Adding metadata tags...');
         await addMetadataToFiles(
           successfulDownloads.map((result) => ({
@@ -163,10 +177,25 @@ program
       }
 
     } catch (error) {
+      if (cancelled || (error instanceof Error && error.message === 'Download cancelled')) {
+        spinner.fail('Download cancelled');
+        process.exit(130);
+      }
+
+      if (error instanceof Error && /Could not read browser cookies/i.test(error.message)) {
+        spinner.fail('Download failed');
+        logger.error(error.message);
+        logger.info('Tip: close Chrome fully, then retry with --cookies-from-browser chrome');
+        logger.info('Alternative: export cookies.txt and run with --cookies <path-to-cookies.txt>');
+        process.exit(1);
+      }
+
       spinner.fail('Download failed');
       logger.error(error instanceof Error ? error.message : 'Unknown error');
       process.exit(1);
     } finally {
+      process.removeListener('SIGINT', handleInterrupt);
+      process.removeListener('SIGTERM', handleInterrupt);
       logger.clearSpinner();
     }
   });
